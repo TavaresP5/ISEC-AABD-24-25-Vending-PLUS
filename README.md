@@ -54,6 +54,6 @@ This repository primarily contains the artifacts developed during the database d
 
 ## Authors
 
-André Tavares
-Guilherme Graça
-João Mesquita
+-André Tavares
+-Guilherme Graça
+-João Mesquita
