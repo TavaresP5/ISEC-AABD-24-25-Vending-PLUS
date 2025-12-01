@@ -1,0 +1,636 @@
+
+CREATE OR REPLACE VIEW VIEW_A AS
+SELECT 
+    m.ID_MAQUINA,
+    V.DATA_VISITA AS DATA_HORA_ABAST,   -- Data do reabastecimento
+    m.LOCAL,
+    a.QUANT_ABASTECIDA,
+    COUNT(p.ID_PRODUTO) AS NUM_PRODUTOS_DIFERENTES
+FROM 
+    MAQUINA m
+    JOIN COMPARTIMENTO c ON m.ID_MAQUINA = c.ID_MAQUINA
+    JOIN GUARDA g ON c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+    JOIN PRODUTO p ON g.ID_PRODUTO = p.ID_PRODUTO
+    JOIN ABASTECE a ON c.ID_COMPARTIMENTO = a.ID_COMPARTIMENTO
+    JOIN VISITA v ON a.ID_VISITA = v.ID_VISITA
+WHERE 
+    p.TIPO = 'Snack'                 -- Apenas produtos do tipo snack
+    AND m.LOCAL LIKE '%Coimbra%'     -- Máquinas em Coimbra
+    AND v.DATA_VISITA >= SYSDATE - 1   -- Últimas 24 horas
+    AND p.QUANT_EM_MAQUINAS = 0          -- Produtos que não estão em stock
+    AND m.ESTADO_MAQUINA != 'Inativa'   -- Máquinas ativas
+    GROUP BY 
+    m.ID_MAQUINA,
+    v.DATA_VISITA,
+    m.LOCAL,
+    a.QUANT_ABASTECIDA
+ORDER BY 
+    a.QUANT_ABASTECIDA;              -- Ordena por quantidade reabastecida
+	
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------	
+
+CREATE OR REPLACE VIEW VIEW_B AS
+SELECT 
+    m.ID_MAQUINA, 
+    m.LOCAL,
+    p.ID_PRODUTO AS REF_PRODUTO,
+    v.DATA_VISITA,
+    c.QUANTIDADE_COMPARTIMENTO AS QUANTIDADE_EXISTENTE,  -- Stock atual em compartimento
+    a.QUANT_ABASTECIDA
+FROM 
+    VIAGEM vi, FAZ f, VISITA v, TEM t, MAQUINA m, 
+    ABASTECE a, COMPARTIMENTO c, GUARDA g, PRODUTO p
+WHERE 
+    vi.ID_VIAGEM = 2025031105              -- Id específico
+    AND vi.ID_FUNCIONARIO = f.ID_FUNCIONARIO
+    AND vi.ID_VIAGEM = f.ID_VIAGEM
+    AND f.ID_VISITA = v.ID_VISITA
+    AND v.ID_VISITA = t.ID_VISITA
+    AND t.ID_MAQUINA = m.ID_MAQUINA
+    AND v.ID_VISITA = a.ID_VISITA
+    AND a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    AND c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+    AND g.ID_PRODUTO = p.ID_PRODUTO
+ORDER BY 
+    v.DATA_VISITA,                     -- Ordenar por data de visita
+    a.QUANT_ABASTECIDA DESC;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_C AS
+SELECT 
+    m.ID_MAQUINA,
+    m.LOCAL,
+    p.ID_PRODUTO AS REF_PRODUTO,
+    p.NOME AS PRODUTO,
+    vm.QUANT_VENDIDA_MES,
+    NVL(vr.QUANT_VEND_DESDE_ULTIMO, 0) AS QUANT_VEND_DESDE_ULTIMO
+FROM 
+    MAQUINA m
+    JOIN (
+        -- Produtos mais vendidos por máquina nos últimos 30 dias
+        SELECT ID_MAQUINA, ID_PRODUTO, QUANT_VENDIDA_MES
+        FROM (
+            SELECT 
+                c.ID_MAQUINA,
+                g.ID_PRODUTO,
+                COUNT(*) AS QUANT_VENDIDA_MES,
+                RANK() OVER (PARTITION BY c.ID_MAQUINA ORDER BY COUNT(*) DESC) AS rnk
+            FROM 
+                VENDA v
+                JOIN GUARDA g ON v.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+                JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+            WHERE 
+                v.DATA_VENDA >= SYSDATE - 30
+            GROUP BY 
+                c.ID_MAQUINA, g.ID_PRODUTO
+        )
+        WHERE rnk = 1
+    ) vm ON m.ID_MAQUINA = vm.ID_MAQUINA
+    JOIN PRODUTO p ON p.ID_PRODUTO = vm.ID_PRODUTO
+    LEFT JOIN (
+        -- Vendas desde o último reabastecimento
+        SELECT 
+            c.ID_MAQUINA,
+            g.ID_PRODUTO,
+            COUNT(*) AS QUANT_VEND_DESDE_ULTIMO
+        FROM 
+            VENDA v
+            JOIN GUARDA g ON v.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+            JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+            JOIN (
+                SELECT 
+                    a.ID_COMPARTIMENTO, 
+                    MAX(vis.DATA_VISITA) AS ULTIMA_DATA
+                FROM 
+                    ABASTECE a
+                    JOIN VISITA vis ON a.ID_VISITA = vis.ID_VISITA
+                GROUP BY 
+                    a.ID_COMPARTIMENTO
+            ) ur ON v.ID_COMPARTIMENTO = ur.ID_COMPARTIMENTO
+        WHERE 
+            v.DATA_VENDA > ur.ULTIMA_DATA
+        GROUP BY 
+            c.ID_MAQUINA, g.ID_PRODUTO
+    ) vr ON vm.ID_MAQUINA = vr.ID_MAQUINA AND vm.ID_PRODUTO = vr.ID_PRODUTO
+    JOIN (
+        -- Capacidade total por máquina
+        SELECT 
+            ID_MAQUINA,
+            SUM(CAP_COMPARTIMENTO) AS CAPACIDADE_MAXIMA_TOTAL
+        FROM 
+            COMPARTIMENTO
+        GROUP BY 
+            ID_MAQUINA
+    ) cm ON m.ID_MAQUINA = cm.ID_MAQUINA
+WHERE 
+    vm.QUANT_VENDIDA_MES <= 0.5 * cm.CAPACIDADE_MAXIMA_TOTAL
+ORDER BY 
+    vm.QUANT_VENDIDA_MES ASC;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_D AS
+SELECT 
+    m.ID_MAQUINA, 
+    m.LOCAL,
+    SQRT(POWER(m.LATITUDE - (SELECT LATITUDE FROM ARMAZEM WHERE LOCAL = 'Taveiro'), 2) + 
+         POWER(m.LONGITUDE - (SELECT LONGITUDE FROM ARMAZEM WHERE LOCAL = 'Taveiro'), 2)) * 111 AS DISTANCIA_KM,   -- Calcula distância em km
+    -- Data do último reabastecimento
+    (SELECT MAX(v.DATA_VISITA)
+     FROM VISITA v, ABASTECE a, COMPARTIMENTO c2
+     WHERE v.ID_VISITA = a.ID_VISITA
+     AND a.ID_COMPARTIMENTO = c2.ID_COMPARTIMENTO
+     AND c2.ID_MAQUINA = m.ID_MAQUINA) AS ULTIMO_ABASTECIMENTO,
+    -- Quantidade total de produtos na máquina
+    (SELECT SUM(c3.QUANTIDADE_COMPARTIMENTO)
+     FROM COMPARTIMENTO c3
+     WHERE c3.ID_MAQUINA = m.ID_MAQUINA) AS QUANTIDADE_TOTAL_PRODUTOS
+FROM 
+    MAQUINA m, 
+    COMPARTIMENTO c, 
+    GUARDA g, 
+    PRODUTO p
+WHERE 
+    m.ID_MAQUINA = c.ID_MAQUINA
+    AND c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+    AND g.ID_PRODUTO = p.ID_PRODUTO
+    AND p.NOME = 'KitKat'  -- Filtra apenas máquinas com stock de KitKat
+    -- Filtra máquinas dentro de 30km do armazém de Taveiro
+    AND SQRT(POWER(m.LATITUDE - (SELECT LATITUDE FROM ARMAZEM WHERE LOCAL = 'Taveiro'), 2) + 
+             POWER(m.LONGITUDE - (SELECT LONGITUDE FROM ARMAZEM WHERE LOCAL = 'Taveiro'), 2)) * 111 <= 30
+GROUP BY 
+    m.ID_MAQUINA, m.LOCAL, m.LATITUDE, m.LONGITUDE
+ORDER BY 
+    DISTANCIA_KM;  -- Ordenar por proximidade do armazém
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_E AS
+WITH 
+-- Calcula total de reabastecimentos por máquina
+abastecimentos_por_maquina AS (
+    SELECT 
+        c.ID_MAQUINA,
+        COUNT(*) as total_abastec
+    FROM 
+        ABASTECE a
+        JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    GROUP BY 
+        c.ID_MAQUINA
+),
+-- Calcula média geral de reabastecimentos
+media_geral_abastecimentos AS (
+    SELECT 
+        AVG(total_abastec) as media
+    FROM 
+        abastecimentos_por_maquina
+),
+-- Identifica máquinas operacionais com reabastecimentos acima da média
+maquinas_validas AS (
+    SELECT 
+        m.ID_MAQUINA
+    FROM 
+        MAQUINA m
+        JOIN abastecimentos_por_maquina apm ON m.ID_MAQUINA = apm.ID_MAQUINA
+        JOIN media_geral_abastecimentos mga ON 1=1
+    WHERE 
+        m.ESTADO_MAQUINA = 'Operacional'
+        AND apm.total_abastec > mga.media
+)
+-- Calcula médias de vendas
+SELECT 
+    v.ID_MAQUINA AS IDMAQUINA,
+    p.TIPO AS PRODUTO,
+    ROUND(AVG(v.QUANTIDADE), 0) AS MEDIAMENSAL  -- Média mensal arredondada
+FROM 
+    VENDA v
+    JOIN maquinas_validas mv ON v.ID_MAQUINA = mv.ID_MAQUINA
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+WHERE 
+    EXTRACT(YEAR FROM v.DATA_VENDA) IN (2023, 2024)  -- Filtra os anos 2023 e 2024
+GROUP BY 
+    v.ID_MAQUINA, p.TIPO
+ORDER BY 
+    MEDIAMENSAL DESC,  -- Ordenar por maior média primeiro
+    p.TIPO;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_F AS 
+  WITH VENDAS_72H AS (
+    SELECT 
+        m.ID_MAQUINA,
+        COUNT() AS TOTAL
+    FROM 
+        VENDA v
+        JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+        JOIN MAQUINA m ON c.ID_MAQUINA = m.ID_MAQUINA
+        JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+    WHERE 
+        p.TIPO = 'Agua'           -- Apenas produtos do tipo Agua
+        AND v.DATA_VENDA >= SYSDATE - 3        -- Últimos 3 dias
+    GROUP BY m.ID_MAQUINA
+),
+TOP_MAQUINA AS (
+    SELECT ID_MAQUINA
+    FROM (
+        SELECT ID_MAQUINA
+        FROM VENDAS_72H
+        ORDER BY TOTAL DESC
+    )
+    WHERE ROWNUM = 1
+)
+SELECT 
+    m.ID_MAQUINA,
+    p.ID_PRODUTO AS REFPRODUTO,
+    COUNT() AS QUANT_VENDIDA      -- Quantidade total vendida desse produto
+FROM
+    VENDA v
+    JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    JOIN MAQUINA m ON c.ID_MAQUINA = m.ID_MAQUINA
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+    JOIN TOP_MAQUINA tm ON m.ID_MAQUINA = tm.ID_MAQUINA
+WHERE 
+    p.TIPO = 'Agua'
+    AND EXTRACT(MONTH FROM v.DATA_VENDA) = 2
+GROUP BY m.ID_MAQUINA, p.ID_PRODUTO;        -- Agrupar por máquina e por produto
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_G AS 
+
+SELECT "VIAGEM", "TIPO_PRODUTO", "QUANT_ABASTECIDA", "NUM_MAQ_ABASTECIDAS"
+FROM (
+
+    SELECT
+        v.ID_VIAGEM AS VIAGEM,
+        p.TIPO AS TIPO_PRODUTO,
+        SUM(a.QUANT_ABASTECIDA) AS QUANT_ABASTECIDA,       -- Soma total da quantidade reabastecida
+        COUNT(DISTINCT m.ID_MAQUINA) AS NUM_MAQ_ABASTECIDAS -- Número de máquinas diferentes reabastecidas
+    FROM ABASTECE a
+    JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    JOIN GUARDA g ON c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+    JOIN PRODUTO p ON g.ID_PRODUTO = p.ID_PRODUTO
+    JOIN MAQUINA m ON c.ID_MAQUINA = m.ID_MAQUINA
+    JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+    JOIN FAZ f ON vi.ID_VISITA = f.ID_VISITA
+    JOIN VIAGEM v ON f.ID_VIAGEM = v.ID_VIAGEM
+    WHERE 
+        EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE) - 1 -- Apenas visitas feitas no ano anterior ao atual
+        AND UPPER(m.LOCAL) LIKE '%COIMBRA%'                                 -- Apenas máquinas localizadas em Coimbra
+    GROUP BY v.ID_VIAGEM, p.TIPO
+    HAVING COUNT(DISTINCT m.ID_MAQUINA) > 3                                 -- Encontrar apenas viagens com mais de 3 máquinas reabastecidas
+    ORDER BY SUM(a.QUANT_ABASTECIDA) DESC                                   -- Ordenar pela quantidade total abastecida, do maior para o menor
+)
+
+-- Apenas retorna as duas primeiras linhas com maior quantidade abastecida
+WHERE ROWNUM <= 2;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_H AS
+SELECT
+    ve.ID_VEICULO AS MATRICULA,
+    ve.MARCA,
+    ve.MODELO,
+    COUNT(DISTINCT ma.ID_MAQUINA) AS N_MAQUINAS_REABASTE   -- Nº de máquinas distintas reabastecidas
+FROM 
+    VEICULO ve
+    JOIN VIAGEM vi ON ve.ID_VEICULO = vi.ID_VEICULO
+    JOIN FAZ f ON vi.ID_VIAGEM = f.ID_VIAGEM
+    JOIN VISITA vis ON f.ID_VISITA = vis.ID_VISITA
+    JOIN TEM t ON vis.ID_VISITA = t.ID_VISITA
+    JOIN MAQUINA ma ON t.ID_MAQUINA = ma.ID_MAQUINA
+    JOIN COMPARTIMENTO c ON ma.ID_MAQUINA = c.ID_MAQUINA
+    JOIN GUARDA g ON c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO
+    JOIN PRODUTO p ON g.ID_PRODUTO = p.ID_PRODUTO
+WHERE 
+    p.TIPO = 'Água 33cl'          -- Apenas produtos do tipo Água 33cl
+    AND vi.DISTANCIA > 50         -- Apenas viagens com mais de 50km
+    AND EXTRACT(MONTH FROM vis.DATA_VISITA) = EXTRACT(MONTH FROM ADD_MONTHS(SYSDATE, -1))  -- Mês passado
+    AND EXTRACT(YEAR FROM vis.DATA_VISITA) = EXTRACT(YEAR FROM ADD_MONTHS(SYSDATE, -1))    -- Mesmo ano
+GROUP BY 
+    ve.ID_VEICULO, ve.MARCA, ve.MODELO
+HAVING 
+    COUNT(DISTINCT ma.ID_MAQUINA) >= 3          -- Mostra apenas veículos que reabasteceram >= 3 máquinas
+ORDER BY 
+    N_MAQUINAS_REABASTE DESC;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_I AS 
+
+
+SELECT 
+    a.LOCAL AS ARMAZEM,                                     -- Localização do armazém
+    m.LOCAL AS MAQUINA,                                     
+    COUNT(DISTINCT vi.ID_VISITA) AS N_VISITAS,              -- Número de visitas feitas à mesma máquina
+    SUM(ab.QUANT_ABASTECIDA) AS QUANT_TOTAL,               -- Quantidade total abastecida na máquina
+    ROUND(SUM(ab.QUANT_ABASTECIDA) / 
+          NULLIF(COUNT(DISTINCT vi.ID_VISITA), 0), 2) 
+          AS QUANT_MEDIA_VISITA,                            -- Média abastecida por visita
+    COUNT(DISTINCT p.ID_PRODUTO) AS N_PROD_DIF             -- Número de produtos diferentes reabastecidos
+FROM 
+    MAQUINA m
+    JOIN TEM t ON m.ID_MAQUINA = t.ID_MAQUINA                        
+    JOIN VISITA vi ON t.ID_VISITA = vi.ID_VISITA                    
+    JOIN FAZ f ON vi.ID_VISITA = f.ID_VISITA                        
+    JOIN VIAGEM v ON f.ID_VIAGEM = v.ID_VIAGEM 
+                AND f.ID_FUNCIONARIO = v.ID_FUNCIONARIO              
+    JOIN VEICULO ve ON v.ID_VEICULO = ve.ID_VEICULO                 
+    JOIN ARMAZEM a ON ve.ID_ARMAZEM = a.ID_ARMAZEM               
+    JOIN COMPARTIMENTO c ON m.ID_MAQUINA = c.ID_MAQUINA              
+    JOIN ABASTECE ab ON c.ID_COMPARTIMENTO = ab.ID_COMPARTIMENTO    
+    JOIN GUARDA g ON c.ID_COMPARTIMENTO = g.ID_COMPARTIMENTO        
+    JOIN PRODUTO p ON g.ID_PRODUTO = p.ID_PRODUTO                    
+WHERE 
+    v.DATA_INICIO >= TRUNC(SYSDATE, 'YY')                            -- Apenas viagens que tiveram início neste ano
+    
+    -- Filtra para considerar apenas o armazém com mais viagens neste ano
+    AND ve.ID_ARMAZEM = (
+        SELECT ID_ARMAZEM FROM (
+            SELECT ve2.ID_ARMAZEM, COUNT(v2.ID_VIAGEM) AS num_viagens
+            FROM VEICULO ve2
+            JOIN VIAGEM v2 ON ve2.ID_VEICULO = v2.ID_VEICULO
+            WHERE EXTRACT(YEAR FROM v2.DATA_INICIO) = EXTRACT(YEAR FROM SYSDATE)
+            GROUP BY ve2.ID_ARMAZEM
+            ORDER BY num_viagens DESC                               -- Ordena pelo maior número de viagens
+        )
+        WHERE ROWNUM = 1                                           
+    )
+
+
+GROUP BY 
+    a.LOCAL, m.LOCAL
+
+-- Ordena pela quantidade de visitas
+ORDER BY 
+    COUNT(DISTINCT vi.ID_VISITA) DESC;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_J_20221485443 AS 
+  SELECT
+    m.ID_MAQUINA,
+    p.ID_PRODUTO,
+    p.NOME AS NOME_PRODUTO,
+    p.PRECO AS PRECO_VENDA,
+    COUNT() AS TOTAL_VENDAS,
+    (p.PRECO COUNT()) AS RECEITA_TOTAL,
+    RANK() OVER (
+        PARTITION BY m.ID_MAQUINA
+        ORDER BY COUNT() DESC
+    ) AS RANK_PRODUTO_MAQUINA
+FROM
+    VENDA v
+    JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    JOIN MAQUINA m ON c.ID_MAQUINA = m.ID_MAQUINA
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+GROUP BY
+    m.ID_MAQUINA,
+    p.ID_PRODUTO,
+    p.NOME,
+    p.PRECO;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_K_20221485443 AS 
+  SELECT
+    m.ID_MAQUINA,
+    m.LOCAL,                                 -- Localização da máquina
+    SUM(CASE WHEN v.ID_VENDA IS NOT NULL THEN 1 ELSE 0 END) AS TOTAL_VENDAS,  -- Soma das vendas realizadas para cada máquina
+    AVG(SUM(CASE WHEN v.ID_VENDA IS NOT NULL THEN 1 ELSE 0 END)) OVER () AS MEDIA_VENDAS,  -- Média de vendas de todas as máquinas
+    CASE
+        WHEN SUM(CASE WHEN v.ID_VENDA IS NOT NULL THEN 1 ELSE 0 END) < AVG(SUM(CASE WHEN v.ID_VENDA IS NOT NULL THEN 1 ELSE 0 END)) OVER () 
+        THEN 'Abaixo da Média'
+        ELSE 'Acima da Média'
+    END AS STATUS
+FROM
+    MAQUINA m
+    LEFT JOIN COMPARTIMENTO c ON m.ID_MAQUINA = c.ID_MAQUINA
+    LEFT JOIN VENDA v ON c.ID_COMPARTIMENTO = v.ID_COMPARTIMENTO
+GROUP BY
+    m.ID_MAQUINA, 
+    m.LOCAL;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_J_2023155012 AS 
+  SELECT 
+    p.ID_PRODUTO,
+    p.NOME,
+    p.TIPO,
+    COUNT() AS TOTAL_VENDAS
+FROM 
+    VENDA v
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+GROUP BY 
+    p.ID_PRODUTO, p.NOME, p.TIPO
+HAVING 
+    COUNT() = (
+        SELECT MAX(CNT) FROM (
+            SELECT COUNT(*) AS CNT
+            FROM VENDA
+            GROUP BY ID_PRODUTO
+        )
+    );
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_K_2023155012 AS 
+  SELECT 
+    m.ID_MAQUINA,
+    m.LOCAL,
+    
+    -- Total de vezes que a máquina foi abastecida este mês
+    (SELECT COUNT(*) 
+     FROM ABASTECE a
+     JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+     JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+     WHERE c.ID_MAQUINA = m.ID_MAQUINA
+       AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+       AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+    ) AS NUM_ABASTECIMENTOS,
+
+    -- Total de vendas da máquina este mês
+    (SELECT COUNT(*) 
+     FROM VENDA v
+     JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+     WHERE c.ID_MAQUINA = m.ID_MAQUINA
+       AND EXTRACT(MONTH FROM v.DATA_VENDA) = EXTRACT(MONTH FROM SYSDATE)
+       AND EXTRACT(YEAR FROM v.DATA_VENDA) = EXTRACT(YEAR FROM SYSDATE)
+    ) AS NUM_VENDAS,
+
+    -- Eficiência: vendas por abastecimento
+    CASE
+        WHEN (SELECT COUNT(*) 
+              FROM ABASTECE a
+              JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+              JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+              WHERE c.ID_MAQUINA = m.ID_MAQUINA
+                AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+                AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+        ) = 0 THEN 0
+        ELSE ROUND(
+            (SELECT COUNT(*) 
+             FROM VENDA v
+             JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+             WHERE c.ID_MAQUINA = m.ID_MAQUINA
+               AND EXTRACT(MONTH FROM v.DATA_VENDA) = EXTRACT(MONTH FROM SYSDATE)
+               AND EXTRACT(YEAR FROM v.DATA_VENDA) = EXTRACT(YEAR FROM SYSDATE)
+            ) /
+            (SELECT COUNT(*) 
+             FROM ABASTECE a
+             JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+             JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+             WHERE c.ID_MAQUINA = m.ID_MAQUINA
+               AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+               AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+            ), 2)
+    END AS EFICIENCIA
+FROM MAQUINA m;
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW VIEW_J_2023141751 AS 
+  SELECT 
+    m.ID_MAQUINA,
+    m.LOCAL AS LOCALIZACAO,
+    m.ESTADO_MAQUINA AS ESTADO_MAQUINA,
+    SUM(m.QUANTIDADE_VENDIDA * p.PRECO) AS FATURAMENTO_TOTAL,
+    COUNT(v.ID_VENDA) AS TOTAL_VENDAS,
+    ROUND(SUM(m.QUANTIDADE_VENDIDA * p.PRECO) / NULLIF(COUNT(v.ID_VENDA), 0), 2) AS MEDIA_POR_MAQUINA
+FROM 
+    VENDA v
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+    JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+    JOIN MAQUINA m ON c.ID_MAQUINA = m.ID_MAQUINA
+GROUP BY 
+    m.ID_MAQUINA, 
+    m.LOCAL, 
+    m.ESTADO_MAQUINA
+ORDER BY 
+    FATURAMENTO_TOTAL DESC;
+	
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW VIEW_K_2023141751 AS 
+  SELECT 
+    v.ID_VEICULO,
+    v.MARCA,
+    v.MODELO,
+    v.CAPACIDADE,
+    COUNT(vi.ID_VIAGEM) AS NUMERO_VIAGENS,
+    SUM(vi.DISTANCIA) AS DISTANCIA_TOTAL_PERCORRIDA,
+    ROUND(SUM(vi.DISTANCIA) / NULLIF(COUNT(vi.ID_VIAGEM), 0), 0) AS MEDIA_DISTANCIA_POR_VIAGEM
+FROM 
+    VEICULO v
+    JOIN VIAGEM vi ON v.ID_VEICULO = vi.ID_VEICULO
+WHERE 
+    v.ID_VEICULO = (
+        SELECT ID_VEICULO
+        FROM (
+            SELECT vi2.ID_VEICULO
+            FROM VIAGEM vi2
+            WHERE EXTRACT(YEAR FROM vi2.DATA_INICIO) = EXTRACT(YEAR FROM SYSDATE)
+            GROUP BY vi2.ID_VEICULO
+            ORDER BY COUNT(vi2.ID_VIAGEM) DESC, SUM(vi2.DISTANCIA) DESC
+        )
+        WHERE ROWNUM = 1
+    )
+GROUP BY 
+    v.ID_VEICULO,
+    v.MARCA,
+    v.MODELO,
+    v.CAPACIDADE
+ORDER BY 
+    NUMERO_VIAGENS DESC,
+    DISTANCIA_TOTAL_PERCORRIDA DESC;
+
+CREATE OR REPLACE VIEW VIEW_K_2023155012 AS
+SELECT 
+    m.ID_MAQUINA,
+    m.LOCAL,
+    
+    -- Total de vezes que a máquina foi abastecida este mês
+    (SELECT COUNT(*) 
+     FROM ABASTECE a
+     JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+     JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+     WHERE c.ID_MAQUINA = m.ID_MAQUINA
+       AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+       AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+    ) AS NUM_ABASTECIMENTOS,
+
+    -- Total de vendas da máquina este mês
+    (SELECT COUNT(*) 
+     FROM VENDA v
+     JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+     WHERE c.ID_MAQUINA = m.ID_MAQUINA
+       AND EXTRACT(MONTH FROM v.DATA_VENDA) = EXTRACT(MONTH FROM SYSDATE)
+       AND EXTRACT(YEAR FROM v.DATA_VENDA) = EXTRACT(YEAR FROM SYSDATE)
+    ) AS NUM_VENDAS,
+
+    -- Eficiência: vendas por abastecimento
+    CASE
+        WHEN (SELECT COUNT(*) 
+              FROM ABASTECE a
+              JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+              JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+              WHERE c.ID_MAQUINA = m.ID_MAQUINA
+                AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+                AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+        ) = 0 THEN 0
+        ELSE ROUND(
+            (SELECT COUNT(*) 
+             FROM VENDA v
+             JOIN COMPARTIMENTO c ON v.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+             WHERE c.ID_MAQUINA = m.ID_MAQUINA
+               AND EXTRACT(MONTH FROM v.DATA_VENDA) = EXTRACT(MONTH FROM SYSDATE)
+               AND EXTRACT(YEAR FROM v.DATA_VENDA) = EXTRACT(YEAR FROM SYSDATE)
+            ) /
+            (SELECT COUNT(*) 
+             FROM ABASTECE a
+             JOIN COMPARTIMENTO c ON a.ID_COMPARTIMENTO = c.ID_COMPARTIMENTO
+             JOIN VISITA vi ON a.ID_VISITA = vi.ID_VISITA
+             WHERE c.ID_MAQUINA = m.ID_MAQUINA
+               AND EXTRACT(MONTH FROM vi.DATA_VISITA) = EXTRACT(MONTH FROM SYSDATE)
+               AND EXTRACT(YEAR FROM vi.DATA_VISITA) = EXTRACT(YEAR FROM SYSDATE)
+            ), 2)
+    END AS EFICIENCIA
+FROM MAQUINA m;
+
+
+CREATE OR REPLACE VIEW VIEW_J_2023155012 AS
+SELECT 
+    p.ID_PRODUTO,
+    p.NOME,
+    p.TIPO,
+    COUNT(*) AS TOTAL_VENDAS
+FROM 
+    VENDA v
+    JOIN PRODUTO p ON v.ID_PRODUTO = p.ID_PRODUTO
+GROUP BY 
+    p.ID_PRODUTO, p.NOME, p.TIPO
+HAVING 
+    COUNT(*) = (
+        SELECT MAX(CNT) FROM (
+            SELECT COUNT(*) AS CNT
+            FROM VENDA
+            GROUP BY ID_PRODUTO
+        )
+    );
+

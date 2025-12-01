@@ -1,0 +1,1135 @@
+PROCEDIMENTOS:
+
+CREATE OR REPLACE
+PROCEDURE abastece_produto (
+    cod_armazem   IN NUMBER,
+    cod_produto   IN NUMBER,
+    quantidade    IN NUMBER
+)
+IS
+    -- Cursor que obtém os compartimentos que precisam do produto, ordenados por maior falta
+    CURSOR c_maquinas IS
+        SELECT c.ID_COMPARTIMENTO, c.ID_MAQUINA,
+               (c.CAP_COMPARTIMENTO - c.STOCK_COMPARTIMENTO) AS falta
+        FROM COMPARTIMENTO c
+        WHERE c.ID_PRODUTO = cod_produto
+          AND c.STOCK_COMPARTIMENTO < c.CAP_COMPARTIMENTO
+        ORDER BY falta DESC;
+
+    -- Variáveis para viagem, visita e entidades relacionadas
+    v_viagem_id    VIAGEM.ID_VIAGEM%TYPE;
+    v_visita_id    VISITA.ID_VISITA%TYPE := 900; -- valor inicial (deveria ser dinâmico)
+    v_func_id      FUNCIONARIO.ID_FUNCIONARIO%TYPE := 101; -- funcionário fixo
+    v_rota_id      ROTA.ID_ROTA%TYPE := 301; -- rota fixa
+    v_veiculo_id   VEICULO.ID_VEICULO%TYPE;
+    v_data_inicio  DATE := SYSDATE;
+    v_restante     NUMBER := quantidade; -- quantidade ainda por distribuir
+    v_dummy        NUMBER; -- variável para verificações
+
+BEGIN
+    -- Valida se o armazém existe
+    SELECT COUNT(*) INTO v_dummy FROM ARMAZEM WHERE ID_ARMAZEM = cod_armazem;
+    IF v_dummy = 0 THEN
+        RAISE_APPLICATION_ERROR(-20806, 'Armazem nao existe');
+    END IF;
+
+    -- Valida se o produto existe
+    SELECT COUNT(*) INTO v_dummy FROM PRODUTO WHERE ID_PRODUTO = cod_produto;
+    IF v_dummy = 0 THEN
+        RAISE_APPLICATION_ERROR(-20802, 'Produto nao existe');
+    END IF;
+
+    -- Verifica se existem compartimentos com stock em falta
+    SELECT COUNT(*) INTO v_dummy
+    FROM COMPARTIMENTO
+    WHERE ID_PRODUTO = cod_produto AND STOCK_COMPARTIMENTO < CAP_COMPARTIMENTO;
+    IF v_dummy = 0 THEN
+        RAISE_APPLICATION_ERROR(-20813, 'Nao ha maquinas com rutura para esse produto');
+    END IF;
+
+    -- Seleciona um veículo disponível no armazém
+    SELECT ID_VEICULO INTO v_veiculo_id
+    FROM VEICULO
+    WHERE ID_ARMAZEM = cod_armazem AND DISPONIVEL = 'S' AND ROWNUM = 1;
+
+    -- Gera novo ID para a viagem
+    SELECT NVL(MAX(ID_VIAGEM), 0) + 1 INTO v_viagem_id FROM VIAGEM;
+
+    -- Insere a nova viagem com estado "Planeada"
+    INSERT INTO VIAGEM (ID_VIAGEM, ID_FUNCIONARIO, ID_ROTA, ID_VEICULO, DATA_INICIO, ESTADO)
+    VALUES (v_viagem_id, v_func_id, v_rota_id, v_veiculo_id, v_data_inicio, 'Planeada');
+
+    -- Percorre os compartimentos em falta e realiza abastecimentos
+    FOR rec IN c_maquinas LOOP
+        EXIT WHEN v_restante <= 0;
+
+        -- Cria uma nova visita à máquina
+        INSERT INTO VISITA (ID_VISITA, DATA_VISITA, ESTADO_MAQUINA, ID_MAQUINA, ID_VIAGEM)
+        VALUES (v_visita_id, SYSDATE, 'Operacional', rec.ID_MAQUINA, v_viagem_id);
+
+        -- Calcula quanto abastecer, sendo o mínimo entre o necessário e o restante disponível
+        DECLARE
+            v_abastecer NUMBER := LEAST(v_restante, rec.falta);
+        BEGIN
+            -- Regista o abastecimento
+            INSERT INTO ABASTECE (ID_COMPARTIMENTO, ID_VISITA, QUANT_ABASTECIDA, ID_PRODUTO)
+            VALUES (rec.ID_COMPARTIMENTO, v_visita_id, v_abastecer, cod_produto);
+
+            -- Atualiza o stock do compartimento
+            UPDATE COMPARTIMENTO
+            SET STOCK_COMPARTIMENTO = STOCK_COMPARTIMENTO + v_abastecer
+            WHERE ID_COMPARTIMENTO = rec.ID_COMPARTIMENTO;
+
+            -- Atualiza o valor restante por abastecer
+            v_restante := v_restante - v_abastecer;
+        END;
+
+        -- Incrementa o ID da visita para a próxima máquina
+        v_visita_id := v_visita_id + 1;
+    END LOOP;
+
+    -- Confirma todas as alterações
+    COMMIT;
+END;
+
+
+
+CREATE OR REPLACE
+PROCEDURE cria_viagem_abast(
+    cod_armazem NUMBER,
+    raio        NUMBER
+) IS
+    -- Variáveis para guardar as coordenadas do armazém
+    lat_armazem ARMAZEM.LATITUDE%TYPE;
+    lon_armazem ARMAZEM.LONGITUDE%TYPE;
+
+    -- Definição de um tipo de registo e coleção (tabela PL/SQL) para armazenar IDs de máquinas
+    TYPE t_maquina IS RECORD (
+        id_maquina MAQUINA.ID_MAQUINA%TYPE
+    );
+    TYPE t_maquinas IS TABLE OF t_maquina INDEX BY PLS_INTEGER;
+    maquinas_lista t_maquinas;
+
+    -- Variáveis auxiliares
+    v_id_rota   NUMBER;
+    v_id_viagem NUMBER;
+    ordem       NUMBER := 1;
+
+BEGIN
+    -- 1. Obter as coordenadas do armazém especificado
+    BEGIN
+        SELECT latitude, longitude INTO lat_armazem, lon_armazem
+        FROM armazem
+        WHERE id_armazem = cod_armazem;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            -- Caso o armazém não exista, lança erro -20811
+            RAISE_APPLICATION_ERROR(-20811, 'Armazém não encontrado.');
+    END;
+
+    -- 2. Verificar se existem máquinas dentro do raio fornecido
+    DECLARE
+        v_count NUMBER;
+    BEGIN
+        SELECT COUNT(DISTINCT m.id_maquina)
+        INTO v_count
+        FROM maquina m
+        JOIN compartimento c ON m.id_maquina = c.id_maquina
+        WHERE distancia_linear(lat_armazem, lon_armazem, m.latitude, m.longitude) <= raio;
+
+        IF v_count = 0 THEN
+            -- Nenhuma máquina encontrada dentro do raio especificado
+            RAISE_APPLICATION_ERROR(-20806, 'Nenhuma máquina no raio especificado.');
+        END IF;
+    END;
+
+    -- 3. Buscar as 10 máquinas com maior rutura de stock dentro do raio
+    SELECT id_maquina
+    BULK COLLECT INTO maquinas_lista
+    FROM (
+        SELECT m.id_maquina,
+               SUM(c.cap_compartimento - c.stock_compartimento) AS rutura
+        FROM maquina m
+        JOIN compartimento c ON m.id_maquina = c.id_maquina
+        WHERE distancia_linear(lat_armazem, lon_armazem, m.latitude, m.longitude) <= raio
+        GROUP BY m.id_maquina
+        ORDER BY rutura DESC
+    )
+    WHERE ROWNUM <= 10;
+
+    -- 4. Criar uma nova rota associada ao armazém
+    SELECT NVL(MAX(id_rota), 0) + 1 INTO v_id_rota FROM rota;
+    INSERT INTO rota (id_rota, nome, distancia_total, id_armazem)
+    VALUES (v_id_rota, 'Rota automática', 0, cod_armazem);
+
+    -- 5. Criar uma nova viagem para a nova rota
+    SELECT NVL(MAX(id_viagem), 0) + 1 INTO v_id_viagem FROM viagem;
+    INSERT INTO viagem (id_viagem, id_rota, estado, data_inicio)
+    VALUES (v_id_viagem, v_id_rota, 'Planeada', SYSDATE);
+
+    -- 6. Preencher a tabela PERTENCE com as máquinas selecionadas
+    FOR i IN 1 .. maquinas_lista.COUNT LOOP
+        INSERT INTO pertence (id_rota, id_maquina, ordem)
+        VALUES (v_id_rota, maquinas_lista(i).id_maquina, ordem);
+        ordem := ordem + 1;
+    END LOOP;
+
+    -- 7. Confirmar as inserções
+    COMMIT;
+END;
+
+
+
+CREATE OR REPLACE
+PROCEDURE encomenda_produtos(
+    cod_armazem NUMBER,
+    datainicio  DATE
+) IS
+    dias_intervalo NUMBER;        -- Guarda o número de dias entre a data de início e hoje
+    v_count_vendas NUMBER;        -- Contador para verificar se houve vendas no intervalo
+
+    -- Cursor que obtém os produtos e os seus totais (vendidos, em máquinas e em stock no armazém)
+    CURSOR produtos_cur IS
+        SELECT p.id_produto,
+               COALESCE(v.vendidos, 0) AS vendidos,
+               COALESCE(m.em_maquinas, 0) AS em_maquinas,
+               COALESCE(a.em_stock, 0) AS em_stock
+        FROM produto p
+        LEFT JOIN (
+            SELECT id_produto, COUNT(*) AS vendidos
+            FROM venda
+            WHERE data_venda >= datainicio
+            GROUP BY id_produto
+        ) v ON p.id_produto = v.id_produto
+        LEFT JOIN (
+            SELECT id_produto, SUM(stock_compartimento) AS em_maquinas
+            FROM compartimento
+            GROUP BY id_produto
+        ) m ON p.id_produto = m.id_produto
+        LEFT JOIN (
+            SELECT id_produto, quantidade_armazenada AS em_stock
+            FROM armazena
+            WHERE id_armazem = cod_armazem
+        ) a ON p.id_produto = a.id_produto;
+
+    -- Variáveis auxiliares
+    v_id_encomenda NUMBER;    -- Código da nova encomenda
+    v_necessario   NUMBER;    -- Quantidade de produto a encomendar
+
+BEGIN
+    -- Validação: verificar se o armazém existe
+    DECLARE
+        dummy NUMBER;
+    BEGIN
+        SELECT 1 INTO dummy
+        FROM armazem
+        WHERE id_armazem = cod_armazem;
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+            RAISE_APPLICATION_ERROR(-20812, 'Armazém não existe.');
+    END;
+
+    -- Cálculo do intervalo de dias entre a data inicial e a atual
+    dias_intervalo := TRUNC(SYSDATE) - TRUNC(datainicio);
+    IF dias_intervalo <= 0 THEN
+        dias_intervalo := 1; -- Previne divisão por zero no cálculo da média
+    END IF;
+
+    -- Verificar se houve vendas no intervalo de tempo
+    SELECT COUNT(*) INTO v_count_vendas
+    FROM venda
+    WHERE data_venda >= datainicio;
+
+    IF v_count_vendas = 0 THEN
+        RAISE_APPLICATION_ERROR(-20806, 'Nenhuma venda desde a data indicada.');
+    END IF;
+
+    -- Gerar novo ID para a encomenda
+    SELECT NVL(MAX(id_encomenda), 0) + 1 INTO v_id_encomenda FROM encomenda;
+
+    -- Ciclo por cada produto retornado no cursor
+    FOR prod IN produtos_cur LOOP
+        -- Cálculo da quantidade necessária para 7 dias (baseado na média diária)
+        v_necessario := CEIL((prod.vendidos / dias_intervalo) * 7) 
+                        - prod.em_maquinas - prod.em_stock;
+
+        -- Se a quantidade necessária for positiva, inserir na tabela ENCOMENDA
+        IF v_necessario > 0 THEN
+            INSERT INTO encomenda (id_encomenda, id_produto, quant_encomenda)
+            VALUES (v_id_encomenda, prod.id_produto, v_necessario);
+        END IF;
+    END LOOP;
+
+    -- Confirmar as alterações
+    COMMIT;
+END;
+
+
+
+CREATE OR REPLACE
+procedure q_proc_2023141751(idmaquina number) is
+    -- Verificação se a máquina existe
+    c number;
+
+    -- Cursor que retorna todos os compartimentos da máquina
+    cursor c1 is
+        select id_compartimento, stock_compartimento
+        from compartimento
+        where id_maquina = idmaquina;
+
+    -- Variável para armazenar a quantidade vendida por compartimento
+    v_vendidas number;
+begin
+    -- Verificar se a máquina existe
+    select count(*) into c
+    from maquina
+    where id_maquina = idmaquina;
+
+    if c = 0 then
+        raise_application_error(-20801, 'código de máquina inexistente');
+    end if;
+
+    -- Loop sobre os compartimentos da máquina
+    for r in c1 loop
+        -- Contar o número de vendas no mês/ano atual para o compartimento
+        select count(*)
+        into v_vendidas
+        from venda
+        where id_compartimento = r.id_compartimento
+          and extract(month from data_venda) = extract(month from sysdate)
+          and extract(year from data_venda) = extract(year from sysdate);
+
+        -- Atualizar o estoque no compartimento
+        update compartimento
+        set stock_compartimento = greatest(0, r.stock_compartimento - v_vendidas),
+            quantidade_compartimento = greatest(0, r.stock_compartimento - v_vendidas)
+        where id_compartimento = r.id_compartimento;
+    end loop;
+
+    -- Atualizar o total de produtos vendidos na máquina
+    update maquina
+    set quantidade_vendida = (
+        select count(*)
+        from venda v
+        join compartimento c on v.id_compartimento = c.id_compartimento
+        where c.id_maquina = idmaquina
+          and extract(month from v.data_venda) = extract(month from sysdate)
+          and extract(year from v.data_venda) = extract(year from sysdate)
+    )
+    where id_maquina = idmaquina;
+
+end;
+
+
+
+CREATE OR REPLACE
+PROCEDURE Q_PROC_2023155012(
+    idmaquina IN NUMBER  -- Parâmetro de entrada: ID da máquina a ser verificada
+) IS
+    v_existente NUMBER;  -- Variável auxiliar para verificar existência da máquina
+BEGIN
+    -- Verifica se a máquina existe na tabela MAQUINA
+    SELECT COUNT(*) INTO v_existente
+    FROM MAQUINA
+    WHERE ID_MAQUINA = idmaquina;
+
+    -- Se não existir, lança exceção -20801
+    IF v_existente = 0 THEN
+        RAISE_APPLICATION_ERROR(-20801, 'Código de máquina inexistente');
+    END IF;
+
+    -- Loop que percorre todos os compartimentos da máquina com stock em falta
+    FOR comp IN (
+        SELECT c.id_compartimento,                   -- ID do compartimento
+               p.nome AS nome_produto,              -- Nome do produto associado ao compartimento
+               c.stock_compartimento,               -- Quantidade atual em stock
+               c.cap_compartimento,                 -- Capacidade máxima do compartimento
+               (c.cap_compartimento - c.stock_compartimento) AS falta -- Quantidade em falta
+        FROM compartimento c
+        JOIN produto p ON c.id_produto = p.id_produto  -- Junção para obter o nome do produto
+        WHERE c.id_maquina = idmaquina                 -- Filtrar apenas os compartimentos da máquina recebida por parâmetro
+          AND c.stock_compartimento < c.cap_compartimento -- Apenas compartimentos que não estão cheios
+        ORDER BY falta DESC                            -- Ordenar do que tem mais falta para o que tem menos
+    ) LOOP
+        -- Impressão do estado do compartimento no DBMS_OUTPUT
+        DBMS_OUTPUT.PUT_LINE(
+            'Compartimento ' || comp.id_compartimento ||
+            ' - Produto: ' || comp.nome_produto ||
+            ' - Stock: ' || comp.stock_compartimento ||
+            '/' || comp.cap_compartimento ||
+            ' - Em falta: ' || comp.falta
+        );
+    END LOOP;
+END;
+
+
+
+CREATE OR REPLACE
+procedure q_proc_2023141751(idmaquina number) is
+    -- Verificação se a máquina existe
+    c number;
+
+    -- Cursor que retorna todos os compartimentos da máquina
+    cursor c1 is
+        select id_compartimento, stock_compartimento
+        from compartimento
+        where id_maquina = idmaquina;
+
+    -- Variável para armazenar a quantidade vendida por compartimento
+    v_vendidas number;
+begin
+    -- Verificar se a máquina existe
+    select count(*) into c
+    from maquina
+    where id_maquina = idmaquina;
+
+    if c = 0 then
+        raise_application_error(-20801, 'código de máquina inexistente');
+    end if;
+
+    -- Loop sobre os compartimentos da máquina
+    for r in c1 loop
+        -- Contar o número de vendas no mês/ano atual para o compartimento
+        select count(*)
+        into v_vendidas
+        from venda
+        where id_compartimento = r.id_compartimento
+          and extract(month from data_venda) = extract(month from sysdate)
+          and extract(year from data_venda) = extract(year from sysdate);
+
+        -- Atualizar o estoque no compartimento
+        update compartimento
+        set stock_compartimento = greatest(0, r.stock_compartimento - v_vendidas),
+            quantidade_compartimento = greatest(0, r.stock_compartimento - v_vendidas)
+        where id_compartimento = r.id_compartimento;
+    end loop;
+
+    -- Atualizar o total de produtos vendidos na máquina
+    update maquina
+    set quantidade_vendida = (
+        select count(*)
+        from venda v
+        join compartimento c on v.id_compartimento = c.id_compartimento
+        where c.id_maquina = idmaquina
+          and extract(month from v.data_venda) = extract(month from sysdate)
+          and extract(year from v.data_venda) = extract(year from sysdate)
+    )
+    where id_maquina = idmaquina;
+
+end;
+
+
+FUNCTIONS:
+
+
+CREATE OR REPLACE
+FUNCTION data_ultimo_abastec(idmaquina NUMBER, idproduto NUMBER) 
+RETURN DATE IS 
+  
+    c NUMBER;              -- Contador para validar existência da máquina
+    c1 NUMBER;             -- Contador para validar existência do produto
+    data_abast DATE;       -- Variável para armazenar a data do último abastecimento
+
+BEGIN
+
+    -- Verifica se a máquina existe
+    SELECT COUNT(*) INTO c FROM maquina
+    WHERE maquina.id_maquina = idmaquina;
+
+    IF c = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20801,'Código de máquina inexistente');
+    END IF;
+
+    -- Verifica se o produto existe
+    SELECT COUNT(*) INTO c1 FROM produto
+    WHERE produto.id_produto = idproduto;
+
+    IF c1 = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20802,'Código de produto inexistente');
+    END IF;
+
+    -- Seleciona a data do último abastecimento do produto na máquina
+    SELECT data_visita INTO data_abast
+    FROM (
+        SELECT v.data_visita
+        FROM visita v
+        JOIN abastece a ON v.id_visita = a.id_visita
+        JOIN compartimento c ON a.id_compartimento = c.id_compartimento
+        WHERE c.id_maquina = idmaquina
+          AND a.id_produto = idproduto
+        ORDER BY v.data_visita DESC
+    )
+    WHERE ROWNUM = 1;
+
+    -- Retorna a data do último abastecimento encontrado
+    RETURN data_abast;
+
+END;
+
+CREATE OR REPLACE
+FUNCTION distancia_entre_maquinas(idmaquina1 NUMBER, idmaquina2 NUMBER) 
+RETURN NUMBER IS
+    R NUMBER := 6371; -- Raio da Terra em Kms
+    PI CONSTANT NUMBER := 3.141592653589793;
+    D_LAT NUMBER ;
+    D_LON NUMBER ;
+    lat1 number;
+    lat2 number;
+    lon1 number;
+    lon2 number;
+    A NUMBER ;
+    D NUMBER ;
+    c number;
+BEGIN
+
+     select count(*) into c from maquina
+     where maquina.id_maquina = idmaquina1;
+
+ if c = 0 then 
+   raise_application_error(-20801,'Código de máquina inexistente');
+   end if;
+
+ if idmaquina1 = idmaquina2 then 
+   raise_application_error(-20810,'Máquinas inválidas. Devem ser diferentes.');
+   end if;
+
+   select latitude,longitude into lat1,lon1
+   from maquina where maquina.id_maquina = idmaquina1;
+
+   select latitude,longitude into lat2,lon2
+   from maquina where maquina.id_maquina = idmaquina2;
+
+
+    D_LAT := (lat2 - lat1) * PI / 180;
+    D_LON := (lon2 - lon1) * PI / 180;
+    A := SIN(D_LAT/2) * SIN(D_LAT/2) + COS(LAT1*PI/180) * COS(LAT2*PI/180) * SIN(D_LON/2) * SIN(D_LON/2);
+    D := R * (2 * ATAN2(SQRT(A), SQRT(1 - A)));
+    RETURN ROUND(D,3);
+END;
+
+
+CREATE OR REPLACE
+FUNCTION distancia_linear(LAT1 NUMBER, LON1 NUMBER, LAT2 NUMBER, LON2 NUMBER) 
+RETURN NUMBER IS
+    R NUMBER := 6371; -- Raio da Terra em Kms
+    PI CONSTANT NUMBER := 3.141592653589793; -- Constante de PI
+    D_LAT NUMBER;  -- Diferença de latitude em radianos
+    D_LON NUMBER;  -- Diferença de longitude em radianos
+    A NUMBER;      -- Parte da fórmula de Haversine
+    D NUMBER;      -- Distância final
+BEGIN
+    -- Converter diferença de latitude para radianos
+    D_LAT := (LAT2 - LAT1) * PI / 180;
+
+    -- Converter diferença de longitude para radianos
+    D_LON := (LON2 - LON1) * PI / 180;
+
+    -- Aplicação da fórmula de Haversine para calcular a distância
+    A := SIN(D_LAT/2) * SIN(D_LAT/2) + 
+         COS(LAT1*PI/180) * COS(LAT2*PI/180) * 
+         SIN(D_LON/2) * SIN(D_LON/2);
+
+    -- Resultado final da distância em km
+    D := R * (2 * ATAN2(SQRT(A), SQRT(1 - A)));
+
+    -- Retorna a distância arredondada a 3 casas decimais
+    RETURN ROUND(D,3);
+END;
+
+
+CREATE OR REPLACE
+FUNCTION distancia_viagem(idviagem NUMBER) 
+RETURN NUMBER IS
+
+    c NUMBER;         -- Variável para verificar existência da viagem
+    d NUMBER;         -- Distância total da viagem (a ser retornada)
+    e VARCHAR(100);   -- Estado atual da viagem
+
+BEGIN
+
+    -- Verifica se a viagem existe
+    SELECT COUNT(id_viagem) INTO c 
+    FROM viagem
+    WHERE viagem.id_viagem = idviagem;
+
+    IF c = 0 THEN
+        RAISE_APPLICATION_ERROR(-20807,'Viagem de abastecimento inexistente');
+    END IF;
+
+    -- Obtém o estado da viagem (ex: Planeada, Concluída, etc.)
+    SELECT estado INTO e 
+    FROM viagem
+    WHERE viagem.id_viagem = idviagem;
+
+    -- Se a viagem estiver concluída, obter a distância total
+    IF e = 'Concluída' THEN
+        SELECT distancia INTO d 
+        FROM viagem, rota
+        WHERE viagem.id_viagem = idviagem
+          AND viagem.id_rota = rota.id_rota;
+    END IF;
+
+    -- Retorna a distância calculada (ou NULL se não estiver concluída)
+    RETURN d;
+
+END;
+
+
+CREATE OR REPLACE
+FUNCTION maquina_mais_proxima(idproduto NUMBER, lat NUMBER, lon NUMBER) 
+RETURN NUMBER IS
+
+    c NUMBER;     -- Verifica existência do produto
+    m NUMBER;     -- ID da máquina mais próxima
+    d NUMBER;     -- Distância calculada
+
+BEGIN
+
+    -- Verifica se o produto existe
+    SELECT COUNT(*) INTO c 
+    FROM produto
+    WHERE produto.id_produto = idproduto;
+
+    IF c = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20802,'Código de produto inexistente');
+    END IF;
+
+    -- Seleciona a máquina mais próxima que contém o produto
+    SELECT id_maquina, distancia
+    INTO m, d
+    FROM (
+        SELECT m.id_maquina,
+               SQRT(POWER(m.latitude - lat, 2) + POWER(m.longitude - lon, 2)) AS distancia
+        FROM maquina m
+        JOIN compartimento c ON m.id_maquina = c.id_maquina
+        JOIN produto p ON c.id_produto = p.id_produto
+        WHERE p.id_produto = idproduto
+        ORDER BY distancia
+    )
+    WHERE ROWNUM = 1;
+
+    -- Retorna o ID da máquina mais próxima
+    RETURN m;
+
+END;
+
+
+CREATE OR REPLACE
+FUNCTION P_FUNC_2023141751(idveiculo NUMBER)
+RETURN NUMBER is
+
+c number;
+v_term number;
+v_and number;
+v_disp number;
+
+begin
+
+select count(*) into c from veiculo
+where veiculo.id_veiculo = idveiculo;
+
+if c = 0 then
+ raise_application_error(-20814,'Código de veiculo inexistente');
+end if;
+
+
+select count(veiculo.id_veiculo)
+    into v_term
+    from viagem,veiculo
+    where veiculo.id_veiculo = idveiculo
+      and veiculo.id_veiculo = viagem.id_veiculo 
+      and veiculo.disponivel = 'S'
+      and extract(month from viagem.data_inicio) = extract(month from sysdate)
+      and extract(year from viagem.data_inicio) = extract(year from sysdate);
+
+
+select count(veiculo.id_veiculo)
+    into v_and
+    from viagem,veiculo
+    where veiculo.id_veiculo = idveiculo
+      and veiculo.id_veiculo = viagem.id_veiculo
+      and viagem.estado = 'Em andamento'
+      and data_fim is null
+      and extract(month from data_inicio) = extract(month from sysdate)
+      and extract(year from data_inicio) = extract(year from sysdate);
+
+
+       if v_term > 0 then
+        v_disp := 100 - ((v_and / v_term) * 100);
+    end if;
+
+    return v_disp;
+
+end;
+
+
+CREATE OR REPLACE
+FUNCTION P_FUNC_2023155012(
+    idmaquina NUMBER  -- Parâmetro de entrada: o ID da máquina a consultar
+) RETURN NUMBER IS
+    total_stock NUMBER;  -- Variável para armazenar o stock total da máquina
+    c NUMBER;            -- Variável auxiliar para verificar se a máquina existe
+BEGIN
+    -- Verifica se a máquina com o ID fornecido existe na tabela MAQUINA
+    SELECT COUNT(*) INTO c
+    FROM maquina
+    WHERE id_maquina = idmaquina;
+
+    -- Se não existir, lança a exceção -20801 (Código de máquina inexistente)
+    IF c = 0 THEN
+        RAISE_APPLICATION_ERROR(-20801, 'Código de máquina inexistente');
+    END IF;
+
+    -- Soma o stock de todos os compartimentos da máquina
+    SELECT SUM(stock_compartimento)
+    INTO total_stock
+    FROM compartimento
+    WHERE id_maquina = idmaquina;
+
+    -- Se a máquina existir mas não tiver compartimentos, o resultado será NULL
+    -- Nesse caso, converte-se para 0 para evitar retornar NULL
+    IF total_stock IS NULL THEN
+        total_stock := 0;
+    END IF;
+
+    -- Retorna o stock total da máquina
+    RETURN total_stock;
+END;
+
+
+CREATE OR REPLACE
+FUNCTION P_FUNC_2023141751(idveiculo NUMBER)
+RETURN NUMBER is
+
+c number;
+v_term number;
+v_and number;
+v_disp number;
+
+begin
+
+select count(*) into c from veiculo
+where veiculo.id_veiculo = idveiculo;
+
+if c = 0 then
+ raise_application_error(-20814,'Código de veiculo inexistente');
+end if;
+
+
+select count(veiculo.id_veiculo)
+    into v_term
+    from viagem,veiculo
+    where veiculo.id_veiculo = idveiculo
+      and veiculo.id_veiculo = viagem.id_veiculo 
+      and veiculo.disponivel = 'S'
+      and extract(month from viagem.data_inicio) = extract(month from sysdate)
+      and extract(year from viagem.data_inicio) = extract(year from sysdate);
+
+
+select count(veiculo.id_veiculo)
+    into v_and
+    from viagem,veiculo
+    where veiculo.id_veiculo = idveiculo
+      and veiculo.id_veiculo = viagem.id_veiculo
+      and viagem.estado = 'Em andamento'
+      and data_fim is null
+      and extract(month from data_inicio) = extract(month from sysdate)
+      and extract(year from data_inicio) = extract(year from sysdate);
+
+
+       if v_term > 0 then
+        v_disp := 100 - ((v_and / v_term) * 100);
+    end if;
+
+    return v_disp;
+
+end;
+
+
+
+
+
+CREATE OR REPLACE
+FUNCTION prox_maquina_sem_produto(idproduto NUMBER, idmaquina NUMBER) 
+RETURN NUMBER IS
+
+    c NUMBER;     -- Verifica existência do produto
+    lat NUMBER;   -- Latitude da máquina de referência
+    lon NUMBER;   -- Longitude da máquina de referência
+    m NUMBER;     -- ID da máquina mais próxima sem o produto
+    d NUMBER;     -- Distância calculada
+
+BEGIN
+
+    -- Verifica se o produto existe
+    SELECT COUNT(*) INTO c 
+    FROM produto
+    WHERE produto.id_produto = idproduto;
+
+    IF c = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20802,'Código de produto inexistente');
+    END IF;
+
+    -- Obtém as coordenadas da máquina de referência
+    SELECT latitude, longitude
+    INTO lat, lon
+    FROM maquina
+    WHERE id_maquina = idmaquina;
+
+    -- Procura a máquina mais próxima (a partir das coordenadas da anterior)
+    -- que esteja associada ao produto mas com stock 0
+    SELECT id_maquina, distancia
+    INTO m, d
+    FROM (
+        SELECT maquina.id_maquina,
+               SQRT(POWER(maquina.latitude - lat, 2) + POWER(maquina.longitude - lon, 2)) AS distancia
+        FROM maquina 
+        JOIN compartimento c ON maquina.id_maquina = c.id_maquina
+        JOIN produto p ON c.id_produto = p.id_produto
+        WHERE p.id_produto = idproduto
+          AND maquina.id_maquina = idmaquina
+          AND c.stock_compartimento = 0
+        ORDER BY distancia
+    )
+    WHERE ROWNUM = 1;
+
+    -- Retorna o ID da máquina mais próxima sem stock do produto
+    RETURN m;
+
+END;
+
+
+CREATE OR REPLACE
+FUNCTION quantidade_em_falta(idmaquina NUMBER, idproduto NUMBER) 
+RETURN NUMBER IS
+
+    c NUMBER;             -- Verifica existência da máquina
+    c1 NUMBER;            -- Verifica existência do produto
+    quant_max NUMBER;     -- Capacidade total dos compartimentos para o produto
+    quant_exis NUMBER;    -- Quantidade existente em stock
+    quant_falta NUMBER;   -- Quantidade em falta (resultado)
+
+BEGIN
+
+    -- Verifica se a máquina existe
+    SELECT COUNT(*) INTO c 
+    FROM maquina
+    WHERE maquina.id_maquina = idmaquina;
+
+    IF c = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20801,'Código de máquina inexistente');
+    END IF;
+
+    -- Verifica se o produto existe
+    SELECT COUNT(*) INTO c1 
+    FROM produto
+    WHERE produto.id_produto = idproduto;
+
+    IF c1 = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20802,'Código de produto inexistente');
+    END IF;
+
+    -- Soma a quantidade em stock e a capacidade máxima de todos os compartimentos
+    -- da máquina para o produto indicado
+    SELECT SUM(stock_compartimento), SUM(cap_compartimento)
+    INTO quant_exis, quant_max 
+    FROM compartimento, maquina, produto
+    WHERE maquina.id_maquina = idmaquina
+      AND compartimento.id_maquina = maquina.id_maquina
+      AND produto.id_produto = idproduto;
+
+    -- Calcula a quantidade em falta
+    quant_falta := quant_max - quant_exis;
+
+    -- Retorna a quantidade que está em falta na máquina
+    RETURN quant_falta;
+
+END;
+
+
+CREATE OR REPLACE
+FUNCTION quantidade_media_diaria(
+    idmaquina  NUMBER,  -- Parâmetro de entrada: ID da máquina
+    idproduto  NUMBER   -- Parâmetro de entrada: ID do produto
+) RETURN NUMBER IS
+
+    -- Variáveis locais para guardar datas e valores intermediários
+    data_ultimo     DATE;    -- Data do último reabastecimento
+    data_penultimo  DATE;    -- Data do penúltimo reabastecimento
+    total_vendido   NUMBER;  -- Número total de unidades vendidas desde o penúltimo abastecimento
+    dias            NUMBER;  -- Número de dias entre os dois abastecimentos
+    media           NUMBER;  -- Quantidade média diária vendida (resultado final)
+
+BEGIN
+    -- Obter a data do último reabastecimento (mais recente) da máquina para o produto
+    SELECT data_visita INTO data_ultimo
+    FROM (
+        SELECT v.data_visita
+        FROM abastece a
+        JOIN compartimento c ON a.id_compartimento = c.id_compartimento
+        JOIN visita v ON a.id_visita = v.id_visita
+        WHERE c.id_maquina = idmaquina
+          AND a.id_produto = idproduto
+        ORDER BY v.data_visita DESC
+    )
+    WHERE ROWNUM = 1;  -- Apanhar apenas a data mais recente
+
+    -- Obter a data do penúltimo reabastecimento
+    SELECT data_visita INTO data_penultimo
+    FROM (
+        SELECT data_visita FROM (
+            SELECT v.data_visita
+            FROM abastece a
+            JOIN compartimento c ON a.id_compartimento = c.id_compartimento
+            JOIN visita v ON a.id_visita = v.id_visita
+            WHERE c.id_maquina = idmaquina
+              AND a.id_produto = idproduto
+            ORDER BY v.data_visita DESC
+        )
+        WHERE ROWNUM <= 2 -- Apanha os dois abastecimentos mais recentes
+        ORDER BY data_visita -- E seleciona o mais antigo dos dois
+    )
+    WHERE ROWNUM = 1;
+
+    -- Contar o total de vendas do produto na máquina desde o penúltimo abastecimento
+    SELECT COUNT(*) INTO total_vendido
+    FROM venda v
+    JOIN compartimento c ON v.id_compartimento = c.id_compartimento
+    WHERE c.id_maquina = idmaquina
+      AND v.id_produto = idproduto
+      AND v.data_venda >= data_penultimo;
+
+    -- Verificação: se não houver vendas, lançar exceção personalizada -20802
+    IF total_vendido IS NULL OR total_vendido = 0 THEN
+        RAISE_APPLICATION_ERROR(-20802, 'Sem vendas desde o penúltimo reabastecimento.');
+    END IF;
+
+    -- Calcular o número de dias entre o penúltimo e o último abastecimento
+    dias := data_ultimo - data_penultimo;
+
+    -- Caso a diferença seja 0 ou negativa (caso raro), definir como pelo menos 1 dia
+    IF dias <= 0 THEN
+        dias := 1;
+    END IF;
+
+    -- Calcular a média diária de vendas
+    media := total_vendido / dias;
+
+    -- Devolver o valor final
+    RETURN media;
+
+-- Se não forem encontrados dois reabastecimentos, é lançada a exceção personalizada -20801
+EXCEPTION
+    WHEN NO_DATA_FOUND THEN
+        RAISE_APPLICATION_ERROR(-20801, 'Menos de dois reabastecimentos encontrados.');
+END;
+
+
+CREATE OR REPLACE
+FUNCTION quantidade_vendida(
+    idmaquina   NUMBER,
+    idproduto   NUMBER,
+    dataInicio  DATE,
+    dataFim     DATE DEFAULT SYSDATE
+) RETURN NUMBER IS
+
+    c NUMBER;   -- Verifica existência da máquina
+    c1 NUMBER;  -- Verifica existência do produto
+    q NUMBER;   -- Quantidade vendida no período
+
+BEGIN
+
+    -- Verifica se a máquina existe
+    SELECT COUNT(*) INTO c 
+    FROM maquina
+    WHERE maquina.id_maquina = idmaquina;
+
+    IF c = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20801,'Código de máquina inexistente');
+    END IF;
+
+    -- Verifica se o produto existe
+    SELECT COUNT(*) INTO c1 
+    FROM produto
+    WHERE produto.id_produto = idproduto;
+
+    IF c1 = 0 THEN 
+        RAISE_APPLICATION_ERROR(-20802,'Código de produto inexistente');
+    END IF;
+
+    -- Verifica se o intervalo temporal é válido
+    IF dataInicio > dataFim THEN
+        RAISE_APPLICATION_ERROR(-20809,'Inválido intervalo temporal');
+    END IF;
+
+    -- Calcula a quantidade vendida (soma de unidades) entre as datas fornecidas
+    SELECT SUM(unidades_vendidas) INTO q 
+    FROM produto, maquina, venda, compartimento
+    WHERE maquina.id_maquina = idmaquina
+      AND maquina.id_maquina = compartimento.id_maquina
+      AND produto.id_produto = idproduto
+      AND venda.data_venda BETWEEN dataInicio AND dataFim;
+
+    -- Retorna a quantidade vendida
+    RETURN q;
+
+END;
+
+
+TRIGGERS:
+
+
+CREATE OR REPLACE
+TRIGGER abastece
+BEFORE INSERT ON ABASTECE
+FOR EACH ROW
+DECLARE
+    v_capacidade COMPARTIMENTO.CAP_COMPARTIMENTO%TYPE; -- Capacidade máxima do compartimento
+BEGIN
+    -- Verifica se a quantidade abastecida é negativa
+    IF :NEW.QUANT_ABASTECIDA < 0 THEN
+        RAISE_APPLICATION_ERROR(-20001, 'Quantidade abastecida nao pode ser negativa.');
+    END IF;
+
+    -- Obtém a capacidade máxima do compartimento em questão
+    SELECT CAP_COMPARTIMENTO
+    INTO v_capacidade
+    FROM COMPARTIMENTO
+    WHERE ID_COMPARTIMENTO = :NEW.ID_COMPARTIMENTO;
+
+    -- Verifica se a quantidade abastecida excede a capacidade do compartimento
+    IF :NEW.QUANT_ABASTECIDA > v_capacidade THEN
+        RAISE_APPLICATION_ERROR(-20002, 'Quantidade abastecida excede capacidade do compartimento.');
+    END IF;
+END;
+
+
+CREATE OR REPLACE
+TRIGGER R_TRIG_2022148544
+BEFORE INSERT ON ABASTECE
+FOR EACH ROW
+DECLARE
+    v_estado VARCHAR2(50);
+BEGIN
+    SELECT m.ESTADO_MAQUINA
+    INTO v_estado
+    FROM MAQUINA m
+    JOIN COMPARTIMENTO c ON m.ID_MAQUINA = c.ID_MAQUINA
+    WHERE c.ID_COMPARTIMENTO = :NEW.ID_COMPARTIMENTO;
+
+    IF v_estado IN ('INATIVA', 'EM MANUTENCAO') THEN
+        RAISE_APPLICATION_ERROR(-20443, 'Nao pode abastecer uma maquina inativa ou em manutencao.');
+    END IF;
+END;
+
+
+create or replace trigger  R_TRIG_2023141751
+before update on compartimento
+for each row
+begin
+    if :new.cap_compartimento > 0 and 
+       (:new.stock_compartimento / :new.cap_compartimento) < 0.2 then  -- verifica se o stock no compartimento é menor que 20%
+
+       :new.stock_compartimento := :new.cap_compartimento;
+       :new.quantidade_compartimento := :new.cap_compartimento;
+
+    end if;
+end;
+
+
+CREATE OR REPLACE
+TRIGGER R_TRIG_2023155012
+BEFORE INSERT ON abastece -- A trigger é ativada antes de cada inserção na tabela ABASTECE
+FOR EACH ROW              -- Executa-se para cada linha inserida
+DECLARE
+    v_id_maquina   NUMBER; -- Variável local para guardar o ID da máquina associada à visita
+    v_data_visita  DATE;   -- Variável local para guardar a data da visita
+    v_count        NUMBER; -- Variável que contará quantos abastecimentos já foram feitos nessa máquina nesse dia
+BEGIN
+    -- Obter o ID da máquina e a data da visita a partir do ID_VISITA fornecido no novo registo
+    SELECT v.id_maquina, v.data_visita
+    INTO v_id_maquina, v_data_visita
+    FROM visita v
+    WHERE v.id_visita = :NEW.id_visita;
+
+    -- Verificar quantos abastecimentos já ocorreram nessa máquina na mesma data
+    SELECT COUNT(*)
+    INTO v_count
+    FROM abastece a
+    JOIN visita v ON a.id_visita = v.id_visita
+    WHERE v.id_maquina = v_id_maquina
+      AND TRUNC(v.data_visita) = TRUNC(v_data_visita); -- Ignora a hora, compara apenas o dia
+
+    -- Se já houver pelo menos um abastecimento nesse dia, impedir o novo registo
+    IF v_count > 0 THEN
+        RAISE_APPLICATION_ERROR(-20814, 'Já houve um abastecimento nesta máquina hoje.');
+    END IF;
+END;
+
+
+CREATE OR REPLACE
+TRIGGER update_viagem
+AFTER INSERT ON ABASTECE
+FOR EACH ROW
+DECLARE
+    v_id_viagem   VIAGEM.ID_VIAGEM%TYPE;  -- Guarda o ID da viagem associada à visita
+    v_existente   NUMBER;                 -- Número de registos existentes na tabela CONTEM para essa viagem e produto
+BEGIN
+    -- Obtém o ID da viagem através da VISITA associada ao abastecimento
+    SELECT ID_VIAGEM INTO v_id_viagem
+    FROM VISITA
+    WHERE ID_VISITA = :NEW.ID_VISITA;
+
+    -- Verifica se já existe registo do produto nesta viagem na tabela CONTEM
+    SELECT COUNT(*)
+    INTO v_existente
+    FROM CONTEM
+    WHERE ID_VIAGEM = v_id_viagem 
+      AND ID_PRODUTO = :NEW.ID_PRODUTO;
+
+    IF v_existente > 0 THEN
+        -- Se já existe, atualiza a quantidade adicionando o novo abastecimento
+        UPDATE CONTEM
+        SET QUANTIDADE_PRODUTO = QUANTIDADE_PRODUTO + :NEW.QUANT_ABASTECIDA
+        WHERE ID_VIAGEM = v_id_viagem 
+          AND ID_PRODUTO = :NEW.ID_PRODUTO;
+    ELSE
+        -- Se não existe, cria nova linha na tabela CONTEM
+        INSERT INTO CONTEM (ID_VIAGEM, ID_PRODUTO, QUANTIDADE_PRODUTO)
+        VALUES (v_id_viagem, :NEW.ID_PRODUTO, :NEW.QUANT_ABASTECIDA);
+    END IF;
+END;
+
+
+CREATE OR REPLACE
+TRIGGER update_stock
+AFTER INSERT ON VENDA
+FOR EACH ROW
+DECLARE
+    v_id_maquina   MAQUINA.ID_MAQUINA%TYPE;  -- ID da máquina associada ao compartimento vendido
+    v_total_stock  NUMBER;                   -- Total de stock da máquina após a venda
+BEGIN
+    -- Atualiza o stock do compartimento, decrementando 1 unidade (assumindo venda unitária)
+    UPDATE COMPARTIMENTO
+    SET STOCK_COMPARTIMENTO = STOCK_COMPARTIMENTO - 1
+    WHERE ID_COMPARTIMENTO = :NEW.ID_COMPARTIMENTO;
+
+    -- Obtém o ID da máquina à qual pertence o compartimento
+    SELECT ID_MAQUINA
+    INTO v_id_maquina
+    FROM COMPARTIMENTO
+    WHERE ID_COMPARTIMENTO = :NEW.ID_COMPARTIMENTO;
+
+    -- Soma o stock de todos os compartimentos da máquina para verificar se ainda tem produto
+    SELECT SUM(STOCK_COMPARTIMENTO)
+    INTO v_total_stock
+    FROM COMPARTIMENTO
+    WHERE ID_MAQUINA = v_id_maquina;
+
+    -- Se o total de stock for 0, atualizar o estado da máquina para 'SEM STOCK'
+    IF v_total_stock = 0 THEN
+        UPDATE MAQUINA
+        SET ESTADO_MAQUINA = 'SEM STOCK'
+        WHERE ID_MAQUINA = v_id_maquina;
+    END IF;
+END;
